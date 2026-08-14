@@ -1,6 +1,8 @@
 package config_test
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/h13/gtm-users/internal/config"
@@ -125,6 +127,15 @@ func TestValidate_Valid(t *testing.T) {
 	errs := config.Validate(cfg)
 	if len(errs) != 0 {
 		t.Errorf("expected no errors, got %v", errs)
+	}
+}
+
+func TestValidationError_Error(t *testing.T) {
+	e := config.ValidationError{Field: "users[0].email", Message: "required"}
+	got := e.Error()
+	want := "users[0].email: required"
+	if got != want {
+		t.Errorf("Error() = %q, want %q", got, want)
 	}
 }
 
@@ -262,5 +273,352 @@ func TestValidate_Errors(t *testing.T) {
 				t.Errorf("got %d errors, want %d: %v", len(errs), tt.wantErrs, errs)
 			}
 		})
+	}
+}
+
+func TestParse_WithRoles(t *testing.T) {
+	data := []byte(`
+account_id: "123"
+mode: additive
+roles:
+  viewer:
+    account_access: user
+    container_access:
+      - container_id: "GTM-AAAA1111"
+        permission: read
+users:
+  - email: alice@example.com
+    role: viewer
+`)
+
+	cfg, err := config.Parse(data)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if cfg.Users[0].AccountAccess != config.AccountAccessUser {
+		t.Errorf("account_access = %q, want %q", cfg.Users[0].AccountAccess, config.AccountAccessUser)
+	}
+	if len(cfg.Users[0].ContainerAccess) != 1 {
+		t.Fatalf("container_access len = %d, want 1", len(cfg.Users[0].ContainerAccess))
+	}
+	if cfg.Users[0].ContainerAccess[0].Permission != config.PermissionRead {
+		t.Errorf("permission = %q, want %q", cfg.Users[0].ContainerAccess[0].Permission, config.PermissionRead)
+	}
+}
+
+func TestParse_RoleOverride(t *testing.T) {
+	data := []byte(`
+account_id: "123"
+mode: additive
+roles:
+  viewer:
+    account_access: user
+    container_access:
+      - container_id: "GTM-AAAA1111"
+        permission: read
+users:
+  - email: alice@example.com
+    role: viewer
+    account_access: admin
+    container_access:
+      - container_id: "GTM-BBBB2222"
+        permission: publish
+`)
+
+	cfg, err := config.Parse(data)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if cfg.Users[0].AccountAccess != config.AccountAccessAdmin {
+		t.Errorf("account_access = %q, want %q (override)", cfg.Users[0].AccountAccess, config.AccountAccessAdmin)
+	}
+	if len(cfg.Users[0].ContainerAccess) != 1 {
+		t.Fatalf("container_access len = %d, want 1", len(cfg.Users[0].ContainerAccess))
+	}
+	if cfg.Users[0].ContainerAccess[0].ContainerID != "GTM-BBBB2222" {
+		t.Errorf("container_id = %q, want GTM-BBBB2222 (override)", cfg.Users[0].ContainerAccess[0].ContainerID)
+	}
+}
+
+func TestParse_UndefinedRole(t *testing.T) {
+	data := []byte(`
+account_id: "123"
+mode: additive
+roles:
+  viewer:
+    account_access: user
+users:
+  - email: alice@example.com
+    role: editor
+`)
+
+	_, err := config.Parse(data)
+	if err == nil {
+		t.Fatal("expected error for undefined role, got nil")
+	}
+}
+
+func TestResolveRoles_NoRoles(t *testing.T) {
+	cfg := config.Config{
+		AccountID: "123",
+		Mode:      config.ModeAdditive,
+		Users: []config.User{
+			{Email: "a@b.com", AccountAccess: config.AccountAccessUser},
+		},
+	}
+
+	resolved, err := config.ResolveRoles(cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(resolved.Users) != 1 {
+		t.Errorf("users len = %d, want 1", len(resolved.Users))
+	}
+}
+
+func TestResolveRoles_RolePlusInline(t *testing.T) {
+	cfg := config.Config{
+		AccountID: "123",
+		Mode:      config.ModeAdditive,
+		Roles: map[string]config.Role{
+			"viewer": {
+				AccountAccess: config.AccountAccessUser,
+				ContainerAccess: []config.ContainerAccess{
+					{ContainerID: "GTM-AAAA1111", Permission: config.PermissionRead},
+				},
+			},
+		},
+		Users: []config.User{
+			{Email: "a@b.com", Role: "viewer"},
+			{Email: "b@c.com", AccountAccess: config.AccountAccessAdmin},
+		},
+	}
+
+	resolved, err := config.ResolveRoles(cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if resolved.Users[0].AccountAccess != config.AccountAccessUser {
+		t.Errorf("users[0].account_access = %q, want user", resolved.Users[0].AccountAccess)
+	}
+	if resolved.Users[1].AccountAccess != config.AccountAccessAdmin {
+		t.Errorf("users[1].account_access = %q, want admin", resolved.Users[1].AccountAccess)
+	}
+}
+
+func writeFile(t *testing.T, dir, name, content string) string {
+	t.Helper()
+	p := filepath.Join(dir, name)
+	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+		t.Fatalf("writing file %s: %v", name, err)
+	}
+	return p
+}
+
+func TestLoad_WithIncludes(t *testing.T) {
+	dir := t.TempDir()
+
+	writeFile(t, dir, "shared.yaml", `
+roles:
+  editor:
+    account_access: user
+    container_access:
+      - container_id: "GTM-BBBB2222"
+        permission: edit
+users:
+  - email: bob@example.com
+    role: editor
+`)
+
+	mainPath := writeFile(t, dir, "main.yaml", `
+account_id: "123456789"
+mode: additive
+includes:
+  - shared.yaml
+users:
+  - email: alice@example.com
+    account_access: admin
+`)
+
+	cfg, err := config.Load(mainPath)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if cfg.AccountID != "123456789" {
+		t.Errorf("account_id = %q, want 123456789", cfg.AccountID)
+	}
+
+	if len(cfg.Users) != 2 {
+		t.Fatalf("users count = %d, want 2", len(cfg.Users))
+	}
+
+	if cfg.Users[0].Email != "alice@example.com" {
+		t.Errorf("users[0].email = %q, want alice", cfg.Users[0].Email)
+	}
+	if cfg.Users[1].Email != "bob@example.com" {
+		t.Errorf("users[1].email = %q, want bob", cfg.Users[1].Email)
+	}
+
+	// Bob should have resolved role permissions.
+	if cfg.Users[1].AccountAccess != config.AccountAccessUser {
+		t.Errorf("bob account_access = %q, want user", cfg.Users[1].AccountAccess)
+	}
+	if len(cfg.Users[1].ContainerAccess) != 1 {
+		t.Fatalf("bob container_access len = %d, want 1", len(cfg.Users[1].ContainerAccess))
+	}
+	if cfg.Users[1].ContainerAccess[0].ContainerID != "GTM-BBBB2222" {
+		t.Errorf("bob container_id = %q, want GTM-BBBB2222", cfg.Users[1].ContainerAccess[0].ContainerID)
+	}
+}
+
+func TestLoad_IncludeRolesUsedByMainUsers(t *testing.T) {
+	dir := t.TempDir()
+
+	writeFile(t, dir, "roles.yaml", `
+roles:
+  viewer:
+    account_access: user
+    container_access:
+      - container_id: "GTM-AAAA1111"
+        permission: read
+users: []
+`)
+
+	mainPath := writeFile(t, dir, "main.yaml", `
+account_id: "123"
+mode: additive
+includes:
+  - roles.yaml
+users:
+  - email: alice@example.com
+    role: viewer
+`)
+
+	cfg, err := config.Load(mainPath)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if cfg.Users[0].AccountAccess != config.AccountAccessUser {
+		t.Errorf("account_access = %q, want user", cfg.Users[0].AccountAccess)
+	}
+}
+
+func TestLoad_IncludeFileNotFound(t *testing.T) {
+	dir := t.TempDir()
+
+	mainPath := writeFile(t, dir, "main.yaml", `
+account_id: "123"
+mode: additive
+includes:
+  - nonexistent.yaml
+users:
+  - email: alice@example.com
+    account_access: user
+`)
+
+	_, err := config.Load(mainPath)
+	if err == nil {
+		t.Fatal("expected error for missing include file, got nil")
+	}
+}
+
+func TestLoad_IncludeFileParseError(t *testing.T) {
+	dir := t.TempDir()
+
+	writeFile(t, dir, "bad.yaml", `this is not valid yaml: [`)
+
+	mainPath := writeFile(t, dir, "main.yaml", `
+account_id: "123"
+mode: additive
+includes:
+  - bad.yaml
+users:
+  - email: alice@example.com
+    account_access: user
+`)
+
+	_, err := config.Load(mainPath)
+	if err == nil {
+		t.Fatal("expected error for bad include file, got nil")
+	}
+}
+
+func TestLoad_IncludeRoleOverride(t *testing.T) {
+	dir := t.TempDir()
+
+	writeFile(t, dir, "shared.yaml", `
+roles:
+  viewer:
+    account_access: user
+users: []
+`)
+
+	mainPath := writeFile(t, dir, "main.yaml", `
+account_id: "123"
+mode: additive
+includes:
+  - shared.yaml
+roles:
+  viewer:
+    account_access: admin
+users:
+  - email: alice@example.com
+    role: viewer
+`)
+
+	cfg, err := config.Load(mainPath)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Main config's viewer role (admin) should override the included one (user).
+	if cfg.Users[0].AccountAccess != config.AccountAccessAdmin {
+		t.Errorf("account_access = %q, want admin (base override)", cfg.Users[0].AccountAccess)
+	}
+}
+
+func TestLoad_ResolveRolesError(t *testing.T) {
+	dir := t.TempDir()
+
+	writeFile(t, dir, "main.yaml", `
+account_id: "123"
+mode: additive
+roles:
+  viewer:
+    account_access: user
+users:
+  - email: alice@example.com
+    role: nonexistent
+`)
+
+	_, err := config.Load(filepath.Join(dir, "main.yaml"))
+	if err == nil {
+		t.Fatal("expected error for undefined role, got nil")
+	}
+}
+
+func TestLoad_IncludeParseRawError(t *testing.T) {
+	dir := t.TempDir()
+
+	writeFile(t, dir, "bad.yaml", `{{{invalid`)
+
+	mainPath := writeFile(t, dir, "main.yaml", `
+account_id: "123"
+mode: additive
+includes:
+  - bad.yaml
+users:
+  - email: alice@example.com
+    account_access: user
+`)
+
+	_, err := config.Load(mainPath)
+	if err == nil {
+		t.Fatal("expected error for invalid include, got nil")
 	}
 }

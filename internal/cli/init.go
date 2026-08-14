@@ -3,18 +3,20 @@ package cli
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 
 	"github.com/h13/gtm-users/internal/output"
 	"github.com/spf13/cobra"
 )
 
-func newExportCmd(opts *rootOptions) *cobra.Command {
+func newInitCmd(opts *rootOptions) *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "export",
-		Short: "Export current GTM user permissions as YAML",
+		Use:   "init",
+		Short: "Bootstrap a config file from current GTM state",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			accountID, _ := cmd.Flags().GetString("account-id")
-			return runExport(opts, accountID)
+			return runInit(opts, accountID)
 		},
 	}
 
@@ -24,7 +26,13 @@ func newExportCmd(opts *rootOptions) *cobra.Command {
 	return cmd
 }
 
-func runExport(opts *rootOptions, accountID string) error {
+func runInit(opts *rootOptions, accountID string) error {
+	outPath := filepath.Clean(opts.configPath)
+
+	if _, err := os.Stat(outPath); err == nil {
+		return fmt.Errorf("config file already exists: %s", outPath)
+	}
+
 	ctx := context.Background()
 	client, err := opts.newClient(ctx, accountID, opts.credentialsPath)
 	if err != nil {
@@ -52,5 +60,15 @@ func runExport(opts *rootOptions, accountID string) error {
 		})
 	}
 
-	return output.PrintExport(opts.stdout, accountID, users)
+	f, err := os.Create(outPath) //nolint:gosec
+	if err != nil {
+		return fmt.Errorf("creating config file: %w", err)
+	}
+
+	if err := output.PrintExport(f, accountID, users); err != nil {
+		_ = f.Close()
+		return err
+	}
+
+	return f.Close()
 }

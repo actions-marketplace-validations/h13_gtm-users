@@ -21,12 +21,37 @@ type Client struct {
 	pathCache map[string]string // email -> API path, populated by FetchState
 }
 
-// NewClient creates a GTM API client with the given credentials file.
-func NewClient(ctx context.Context, accountID string, credentialsFile string) (*Client, error) {
-	svc, err := tagmanager.NewService(ctx,
-		option.WithCredentialsFile(credentialsFile), //nolint:staticcheck // no replacement available yet
+// Option configures Client construction.
+type Option func(*options)
+
+type options struct {
+	apiOpts []option.ClientOption
+}
+
+// WithAPIOptions passes additional google-api client options (e.g. WithHTTPClient for testing).
+func WithAPIOptions(opts ...option.ClientOption) Option {
+	return func(o *options) {
+		o.apiOpts = append(o.apiOpts, opts...)
+	}
+}
+
+// NewClient creates a GTM API client. When credentialsFile is empty,
+// Application Default Credentials (ADC) are used, which supports
+// Workload Identity Federation on GitHub Actions, GitLab CI, and other CI/CD platforms.
+func NewClient(ctx context.Context, accountID string, credentialsFile string, opts ...Option) (*Client, error) {
+	o := &options{}
+	for _, fn := range opts {
+		fn(o)
+	}
+
+	apiOpts := append([]option.ClientOption{
 		option.WithScopes(tagmanager.TagmanagerManageUsersScope),
-	)
+	}, o.apiOpts...)
+	if credentialsFile != "" {
+		apiOpts = append(apiOpts, option.WithCredentialsFile(credentialsFile)) //nolint:staticcheck // no replacement available yet
+	}
+
+	svc, err := tagmanager.NewService(ctx, apiOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("creating tagmanager service: %w", err)
 	}

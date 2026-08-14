@@ -3,28 +3,39 @@ package cli
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
+	"time"
 
 	"github.com/h13/gtm-users/internal/output"
 	"github.com/spf13/cobra"
 )
 
-func newExportCmd(opts *rootOptions) *cobra.Command {
+func newBackupCmd(opts *rootOptions) *cobra.Command {
+	var outputPath string
 	cmd := &cobra.Command{
-		Use:   "export",
-		Short: "Export current GTM user permissions as YAML",
+		Use:   "backup",
+		Short: "Save current GTM state as a YAML backup",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			accountID, _ := cmd.Flags().GetString("account-id")
-			return runExport(opts, accountID)
+			return runBackup(opts, accountID, outputPath)
 		},
 	}
 
 	cmd.Flags().String("account-id", "", "GTM account ID (required)")
 	_ = cmd.MarkFlagRequired("account-id")
+	cmd.Flags().StringVarP(&outputPath, "output", "o", "", "output file path (default: backup-{timestamp}.yaml)")
 
 	return cmd
 }
 
-func runExport(opts *rootOptions, accountID string) error {
+func runBackup(opts *rootOptions, accountID, outputPath string) error {
+	if outputPath == "" {
+		outputPath = fmt.Sprintf("backup-%s.yaml", time.Now().Format("20060102-150405"))
+	}
+
+	outPath := filepath.Clean(outputPath)
+
 	ctx := context.Background()
 	client, err := opts.newClient(ctx, accountID, opts.credentialsPath)
 	if err != nil {
@@ -52,5 +63,20 @@ func runExport(opts *rootOptions, accountID string) error {
 		})
 	}
 
-	return output.PrintExport(opts.stdout, accountID, users)
+	f, err := os.Create(outPath)
+	if err != nil {
+		return fmt.Errorf("creating backup file: %w", err)
+	}
+
+	if err := output.PrintExport(f, accountID, users); err != nil {
+		_ = f.Close()
+		return err
+	}
+
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("closing backup file: %w", err)
+	}
+
+	_, err = fmt.Fprintf(opts.stdout, "Backup saved to %s\n", outPath)
+	return err
 }

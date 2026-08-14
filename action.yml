@@ -15,7 +15,10 @@ inputs:
     required: false
     default: "gtm-users.yaml"
   credentials:
-    description: "GCP service account credentials JSON content"
+    description: >-
+      GCP service account credentials JSON content.
+      Optional when using Workload Identity Federation (WIF) or other
+      Application Default Credentials (ADC) — e.g. via google-github-actions/auth.
     required: false
   format:
     description: "Output format (text, json)"
@@ -49,7 +52,7 @@ runs:
   using: "composite"
   steps:
     - name: Set up Go
-      uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
       with:
         go-version: ${{ inputs.go-version }}
         cache: false
@@ -142,7 +145,7 @@ runs:
         inputs.command == 'plan'
         && inputs.comment-on-pr == 'true'
         && github.event_name == 'pull_request'
-      uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
       env:
         PLAN_OUTPUT: ${{ steps.run.outputs.result }}
         WORKFLOW_NAME: ${{ github.workflow }}

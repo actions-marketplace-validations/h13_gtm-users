@@ -38,27 +38,40 @@ const (
 	PermissionPublish ContainerPermission = "publish"
 )
 
+// msgRequired is the ValidationError message for a missing mandatory field.
+const msgRequired = "required"
+
 // ContainerAccess pairs a container ID with a permission level.
 type ContainerAccess struct {
 	ContainerID string              `yaml:"container_id"`
 	Permission  ContainerPermission `yaml:"permission"`
 }
 
+// Role defines a reusable permission template.
+type Role struct {
+	AccountAccess   AccountAccess     `yaml:"account_access"`
+	ContainerAccess []ContainerAccess `yaml:"container_access,omitempty"`
+}
+
 // User represents a GTM user's desired permission state.
 type User struct {
 	Email           string            `yaml:"email"`
-	AccountAccess   AccountAccess     `yaml:"account_access"`
+	Role            string            `yaml:"role,omitempty"`
+	AccountAccess   AccountAccess     `yaml:"account_access,omitempty"`
 	ContainerAccess []ContainerAccess `yaml:"container_access,omitempty"`
 }
 
 // Config is the top-level YAML configuration.
 type Config struct {
-	AccountID string `yaml:"account_id"`
-	Mode      Mode   `yaml:"mode"`
-	Users     []User `yaml:"users"`
+	Includes  []string        `yaml:"includes,omitempty"`
+	AccountID string          `yaml:"account_id"`
+	Mode      Mode            `yaml:"mode"`
+	Roles     map[string]Role `yaml:"roles,omitempty"`
+	Policy    *Policy         `yaml:"policy,omitempty"`
+	Users     []User          `yaml:"users"`
 }
 
-// Load reads and parses a YAML config file.
+// Load reads and parses a YAML config file, processing any includes.
 func Load(path string) (Config, error) {
 	cleaned := filepath.Clean(path)
 	data, err := os.ReadFile(cleaned)
@@ -66,12 +79,52 @@ func Load(path string) (Config, error) {
 		return Config{}, fmt.Errorf("reading config file: %w", err)
 	}
 
-	return Parse(data)
+	cfg, err := parseRaw(data)
+	if err != nil {
+		return Config{}, err
+	}
+
+	// Process includes.
+	baseDir := filepath.Dir(cleaned)
+	for _, inc := range cfg.Includes {
+		incPath := filepath.Join(baseDir, inc)
+		incData, err := os.ReadFile(filepath.Clean(incPath))
+		if err != nil {
+			return Config{}, fmt.Errorf("reading include file %s: %w", inc, err)
+		}
+		incCfg, err := parseRaw(incData)
+		if err != nil {
+			return Config{}, fmt.Errorf("parsing include file %s: %w", inc, err)
+		}
+		cfg = MergeConfigs(cfg, incCfg)
+	}
+
+	resolved, err := ResolveRoles(cfg)
+	if err != nil {
+		return Config{}, err
+	}
+
+	return resolved, nil
 }
 
 // Parse parses YAML bytes into a Config.
 // Unknown fields in the YAML are rejected to catch typos early.
 func Parse(data []byte) (Config, error) {
+	cfg, err := parseRaw(data)
+	if err != nil {
+		return Config{}, err
+	}
+
+	resolved, err := ResolveRoles(cfg)
+	if err != nil {
+		return Config{}, err
+	}
+
+	return resolved, nil
+}
+
+// parseRaw parses YAML bytes into a Config without resolving roles.
+func parseRaw(data []byte) (Config, error) {
 	var cfg Config
 
 	dec := yaml.NewDecoder(bytes.NewReader(data))
@@ -86,6 +139,51 @@ func Parse(data []byte) (Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// ResolveRoles expands role references in users.
+// For each user with a role, the role's permissions are copied.
+// User-level fields override role fields when both are specified.
+func ResolveRoles(cfg Config) (Config, error) {
+	if len(cfg.Roles) == 0 {
+		return cfg, nil
+	}
+
+	resolved := make([]User, 0, len(cfg.Users))
+	for i, u := range cfg.Users {
+		if u.Role == "" {
+			resolved = append(resolved, u)
+			continue
+		}
+
+		role, ok := cfg.Roles[u.Role]
+		if !ok {
+			return Config{}, fmt.Errorf("users[%d]: undefined role %q", i, u.Role)
+		}
+
+		newUser := User{
+			Email:           u.Email,
+			AccountAccess:   role.AccountAccess,
+			ContainerAccess: role.ContainerAccess,
+		}
+
+		// User-level overrides.
+		if u.AccountAccess != "" {
+			newUser.AccountAccess = u.AccountAccess
+		}
+		if len(u.ContainerAccess) > 0 {
+			newUser.ContainerAccess = u.ContainerAccess
+		}
+
+		resolved = append(resolved, newUser)
+	}
+
+	return Config{
+		AccountID: cfg.AccountID,
+		Mode:      cfg.Mode,
+		Roles:     cfg.Roles,
+		Users:     resolved,
+	}, nil
 }
 
 var (
@@ -127,12 +225,14 @@ func Validate(cfg Config) []ValidationError {
 		errs = validateUser(errs, u, i, seen)
 	}
 
+	errs = append(errs, ValidatePolicy(cfg)...)
+
 	return errs
 }
 
 func validateTopLevel(errs []ValidationError, cfg Config) []ValidationError {
 	if cfg.AccountID == "" {
-		errs = append(errs, ValidationError{Field: "account_id", Message: "required"})
+		errs = append(errs, ValidationError{Field: "account_id", Message: msgRequired})
 	}
 
 	if cfg.Mode != ModeAdditive && cfg.Mode != ModeAuthoritative {
@@ -155,7 +255,7 @@ func validateUser(errs []ValidationError, u User, idx int, seen map[string]bool)
 	email := strings.ToLower(u.Email)
 	switch {
 	case email == "":
-		errs = append(errs, ValidationError{Field: prefix + ".email", Message: "required"})
+		errs = append(errs, ValidationError{Field: prefix + ".email", Message: msgRequired})
 	case !emailRegex.MatchString(email):
 		errs = append(errs, ValidationError{Field: prefix + ".email", Message: fmt.Sprintf("invalid email: %s", u.Email)})
 	case seen[email]:
@@ -185,7 +285,7 @@ func validateContainerAccess(errs []ValidationError, ca ContainerAccess, prefix 
 
 	switch {
 	case ca.ContainerID == "":
-		errs = append(errs, ValidationError{Field: caPrefix + ".container_id", Message: "required"})
+		errs = append(errs, ValidationError{Field: caPrefix + ".container_id", Message: msgRequired})
 	case !containerIDRe.MatchString(ca.ContainerID):
 		errs = append(errs, ValidationError{
 			Field:   caPrefix + ".container_id",
